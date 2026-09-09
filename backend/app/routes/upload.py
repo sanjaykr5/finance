@@ -1,22 +1,80 @@
 import hashlib
 import json
+import time
+import uuid
+from dataclasses import dataclass, field
+from threading import Lock
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 
-from ..db import dedup_hash, get_conn
-from ..parsers.base import PasswordRequiredError, UnsupportedFileError
+from ..db import dedup_hash, get_conn, get_decrypted_password
+from ..parsers.base import ParsedTransaction, PasswordRequiredError, UnsupportedFileError
 from ..parsers.detect import PARSERS_BY_KEY
 from .tags import apply_rules_to_transaction_ids
 
 router = APIRouter()
 
+_STAGING_TTL_SECONDS = 30 * 60
 
-@router.post("/upload")
-async def upload(
+
+@dataclass
+class StagedUpload:
+    account_id: int
+    table_name: str
+    label: str
+    filename: str
+    sha256: str
+    rows: list[ParsedTransaction]
+    dedup_hashes: list[str]  # parallel to rows
+    created_at: float = field(default_factory=time.monotonic)
+
+
+_staging: dict[str, StagedUpload] = {}
+_staging_lock = Lock()
+
+
+def _sweep_staging() -> None:
+    """Drop abandoned previews (parsed but never confirmed or cancelled)
+    older than the TTL, so memory doesn't grow unbounded. Opportunistic —
+    run at the top of every parse call rather than on a background thread,
+    which is enough for a single-user local app.
+    """
+    cutoff = time.monotonic() - _STAGING_TTL_SECONDS
+    with _staging_lock:
+        expired = [t for t, s in _staging.items() if s.created_at < cutoff]
+        for t in expired:
+            del _staging[t]
+
+
+def _row_to_preview(index: int, t: ParsedTransaction, duplicate: bool) -> dict:
+    return {
+        "index": index,
+        "txn_date": str(t.txn_date),
+        "description": t.description,
+        "amount": str(t.amount),
+        "txn_type": t.txn_type,
+        "account_last4": t.account_last4,
+        "instrument": t.instrument,
+        "txn_ref": t.txn_ref,
+        "txn_time": t.txn_time,
+        "transaction_id": t.transaction_id,
+        "duplicate": duplicate,
+    }
+
+
+class ConfirmUpload(BaseModel):
+    upload_token: str
+    selected_indices: list[int]
+
+
+@router.post("/upload/parse")
+async def parse_upload(
     file: UploadFile = File(...),
     account_id: int = Form(...),
     password: str | None = Form(None),
 ):
+    _sweep_staging()
     conn = get_conn()
 
     account = conn.execute(
@@ -41,44 +99,78 @@ async def upload(
     ).fetchone()
     if existing:
         return {
-            "parser": None,
-            "parsed": 0,
-            "inserted": 0,
-            "skipped_duplicates": 0,
+            "status": "duplicate_file",
             "message": "This exact file was already uploaded.",
         }
 
+    effective_password = password or get_decrypted_password(conn, account_id)
+
     try:
-        parsed_txns = parser.parse(content, password)
+        parsed_txns = parser.parse(content, effective_password)
     except PasswordRequiredError as e:
         raise HTTPException(400, f"PDF password required or incorrect: {e}")
     except UnsupportedFileError as e:
         raise HTTPException(400, str(e))
 
-    # Snapshot dedup hashes already committed to *this account's* table from
-    # earlier uploads. A hash is only treated as a duplicate against this
-    # fixed snapshot, never against a sibling row inserted moments earlier
-    # in this same batch — this file already passed the sha256 check above,
-    # so every row in it is new by definition, even if two of them happen to
-    # look identical (e.g. two same-day, same-amount orders at the same
-    # merchant, which HSBC in particular gives no reference number to tell
-    # apart).
+    # Snapshot of hashes already committed to this account's table — same
+    # semantics as the old single-shot upload: a hash is only a duplicate
+    # against rows already in the DB, never against a sibling row in this
+    # same batch (two genuinely distinct transactions can share a hash).
     existing_hashes = {
         r[0]
         for r in conn.execute(f'SELECT dedup_hash FROM "{table_name}"').fetchall()
     }
 
-    inserted = 0
-    skipped = 0
-    inserted_ids: list[int] = []
+    dedup_hashes = []
+    duplicates = []
     for t in parsed_txns:
-        dedup = dedup_hash(t.txn_date, t.amount, t.description, t.account_last4, t.txn_ref)
-        if dedup in existing_hashes:
-            skipped += 1
-            continue
+        h = dedup_hash(t.txn_date, t.amount, t.description, t.account_last4, t.txn_ref)
+        dedup_hashes.append(h)
+        duplicates.append(h in existing_hashes)
+
+    token = uuid.uuid4().hex
+    with _staging_lock:
+        _staging[token] = StagedUpload(
+            account_id=account_id,
+            table_name=table_name,
+            label=label,
+            filename=file.filename,
+            sha256=sha,
+            rows=parsed_txns,
+            dedup_hashes=dedup_hashes,
+        )
+
+    return {
+        "status": "ok",
+        "upload_token": token,
+        "parser": label,
+        "rows": [
+            _row_to_preview(i, t, d)
+            for i, (t, d) in enumerate(zip(parsed_txns, duplicates))
+        ],
+    }
+
+
+@router.post("/upload/confirm")
+def confirm_upload(body: ConfirmUpload):
+    with _staging_lock:
+        staged = _staging.pop(body.upload_token, None)
+    if staged is None:
+        raise HTTPException(
+            404, "Upload session expired or already confirmed — re-parse the file."
+        )
+
+    selected_indices = sorted(set(body.selected_indices))
+    if any(i < 0 or i >= len(staged.rows) for i in selected_indices):
+        raise HTTPException(400, "selected_indices contains an out-of-range index")
+
+    conn = get_conn()
+    inserted_ids: list[int] = []
+    for i in selected_indices:
+        t = staged.rows[i]
         row = conn.execute(
             f"""
-            INSERT INTO "{table_name}"
+            INSERT INTO "{staged.table_name}"
               (id, txn_date, description, amount, txn_type,
                account_last4, instrument, txn_ref, txn_time, transaction_id,
                source_file, raw, dedup_hash)
@@ -95,12 +187,11 @@ async def upload(
                 t.txn_ref,
                 t.txn_time,
                 t.transaction_id,
-                file.filename,
+                staged.filename,
                 json.dumps(t.raw, default=str),
-                dedup,
+                staged.dedup_hashes[i],
             ],
         ).fetchone()
-        inserted += 1
         inserted_ids.append(row[0])
 
     conn.execute(
@@ -109,15 +200,25 @@ async def upload(
           (id, filename, sha256, account_id, parser_used, rows_parsed, rows_inserted)
         VALUES (nextval('seq_file'), ?, ?, ?, ?, ?, ?)
         """,
-        [file.filename, sha, account_id, label, len(parsed_txns), inserted],
+        [
+            staged.filename, staged.sha256, staged.account_id, staged.label,
+            len(staged.rows), len(inserted_ids),
+        ],
     )
 
     auto_tagged = apply_rules_to_transaction_ids(inserted_ids)
 
     return {
-        "parser": label,
-        "parsed": len(parsed_txns),
-        "inserted": inserted,
-        "skipped_duplicates": skipped,
+        "parser": staged.label,
+        "parsed": len(staged.rows),
+        "inserted": len(inserted_ids),
+        "skipped_duplicates": len(staged.rows) - len(inserted_ids),
         "auto_tagged": auto_tagged,
     }
+
+
+@router.delete("/upload/parse/{token}")
+def cancel_upload(token: str):
+    with _staging_lock:
+        _staging.pop(token, None)
+    return {"ok": True}
