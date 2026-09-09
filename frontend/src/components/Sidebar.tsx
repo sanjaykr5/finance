@@ -1,6 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import {
   CreditCard,
+  Landmark,
   LayoutDashboard,
   Receipt,
   Tags as TagsIcon,
@@ -13,6 +14,7 @@ const links = [
   { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/transactions', label: 'Transactions', icon: Receipt },
   { to: '/credit-cards', label: 'Credit Cards', icon: CreditCard },
+  { to: '/accounts', label: 'Accounts', icon: Landmark },
   { to: '/upload', label: 'Upload', icon: UploadIcon },
   { to: '/tags', label: 'Tags & Rules', icon: TagsIcon },
 ]

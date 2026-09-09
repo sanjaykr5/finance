@@ -4,6 +4,7 @@ import Dashboard from '@/pages/Dashboard'
 import Upload from '@/pages/Upload'
 import Transactions from '@/pages/Transactions'
 import CreditCards from '@/pages/CreditCards'
+import Accounts from '@/pages/Accounts'
 import Tags from '@/pages/Tags'
 
 export default function App() {
@@ -15,6 +16,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/accounts" element={<Accounts />} />
             <Route path="/upload" element={<Upload />} />
             <Route path="/transactions" element={<Transactions />} />
             <Route path="/credit-cards" element={<CreditCards />} />
