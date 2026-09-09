@@ -7,6 +7,8 @@ from pathlib import Path
 
 import duckdb
 
+from . import crypto
+
 DB_PATH = Path(__file__).resolve().parent.parent / "expense.duckdb"
 
 _conn: duckdb.DuckDBPyConnection | None = None
@@ -82,6 +84,7 @@ def _bootstrap(conn: duckdb.DuckDBPyConnection) -> None:
         );
         """
     )
+    _migrate_accounts_password_column(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS tags (
@@ -174,11 +177,15 @@ def register_account(
     nickname: str | None = None,
     account_last4: str | None = None,
     parser: str | None = None,
+    password: str | None = None,
 ) -> dict:
     """Create a new account's physical table, register it, and rebuild the
     union view. Returns the new `accounts` row as a dict (includes
     `table_name`; callers that don't want to expose that internal detail
-    should pop it before returning to a client).
+    should pop it before returning to a client) plus `has_password`.
+
+    `password`, if given, is encrypted before being stored — see
+    `crypto.py`. It never appears in the returned dict.
     """
     table_name = _next_table_name(conn, kind, provider)
     label = _default_label(kind, provider)
@@ -191,8 +198,66 @@ def register_account(
         """,
         [kind, provider, nickname, account_last4, table_name, parser, label],
     ).fetchone()
+    if password:
+        conn.execute(
+            "UPDATE accounts SET encrypted_password = ? WHERE id = ?",
+            [crypto.encrypt_password(password), row[0]],
+        )
     _rebuild_all_transactions_view(conn)
-    return dict(zip(_ACCOUNT_COLUMNS, row))
+    result = dict(zip(_ACCOUNT_COLUMNS, row))
+    result["has_password"] = bool(password)
+    return result
+
+
+def update_account(conn: duckdb.DuckDBPyConnection, account_id: int, **fields) -> dict | None:
+    """Partially update an existing account. `fields` may include any of
+    `nickname`, `account_last4`, `password` — only keys actually passed are
+    written (the route layer uses Pydantic's `exclude_unset` to build this
+    dict, so an omitted field is left alone). `password=""` clears the
+    stored password; a non-empty `password` is encrypted and stored.
+    `kind`/`provider` are intentionally not accepted here — both are baked
+    into the account's physical table name and parser assignment at
+    creation time. Returns the refreshed account dict (matching
+    `register_account`'s shape) or `None` if the id doesn't exist.
+    """
+    exists = conn.execute("SELECT 1 FROM accounts WHERE id = ?", [account_id]).fetchone()
+    if not exists:
+        return None
+
+    sets: list[str] = []
+    params: list = []
+    if "nickname" in fields:
+        sets.append("nickname = ?")
+        params.append(fields["nickname"])
+    if "account_last4" in fields:
+        sets.append("account_last4 = ?")
+        params.append(fields["account_last4"])
+    if "password" in fields:
+        password = fields["password"]
+        sets.append("encrypted_password = ?")
+        params.append(crypto.encrypt_password(password) if password else None)
+
+    if sets:
+        params.append(account_id)
+        conn.execute(f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", params)
+
+    row = conn.execute(
+        f"""
+        SELECT {", ".join(_ACCOUNT_COLUMNS)}, encrypted_password IS NOT NULL AS has_password
+        FROM accounts WHERE id = ?
+        """,
+        [account_id],
+    ).fetchone()
+    return dict(zip(_ACCOUNT_COLUMNS + ("has_password",), row))
+
+
+def get_decrypted_password(conn: duckdb.DuckDBPyConnection, account_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT encrypted_password FROM accounts WHERE id = ?", [account_id]
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return crypto.decrypt_password(row[0])
 
 
 def drop_account(conn: duckdb.DuckDBPyConnection, account_id: int) -> bool:
@@ -272,6 +337,22 @@ def _rebuild_all_transactions_view(conn: duckdb.DuckDBPyConnection) -> None:
             """
         )
     conn.execute("CREATE VIEW all_transactions AS " + " UNION ALL ".join(branches))
+
+
+def _migrate_accounts_password_column(conn: duckdb.DuckDBPyConnection) -> None:
+    """One-time upgrade: add the encrypted_password column to `accounts` if
+    it doesn't exist yet. DuckDB's ALTER TABLE ADD COLUMN has no IF NOT
+    EXISTS clause, so check information_schema first — same pattern as
+    _migrate_legacy_transactions_table.
+    """
+    exists = conn.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'accounts' AND column_name = 'encrypted_password'
+        """
+    ).fetchone()
+    if not exists:
+        conn.execute("ALTER TABLE accounts ADD COLUMN encrypted_password VARCHAR")
 
 
 # Sources the app used to write into a single `transactions` table, back
