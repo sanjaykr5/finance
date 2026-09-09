@@ -87,6 +87,34 @@ def test_confirm_is_single_use(client):
     assert len(txns) == 2  # the second, failed confirm must not double-insert
 
 
+def test_double_confirm_of_same_file_bytes_via_two_tokens_is_rejected(client):
+    """Two separate /upload/parse calls on identical bytes (e.g. two browser
+    tabs) each get their own token. Confirming both must not double-insert
+    transaction rows nor 500 — the second confirm should be rejected with
+    409 and the DB should reflect only the first confirm's rows.
+    """
+    account_id = _register_phonepe_account(client)
+    first_token = _upload_csv(client, account_id).json()["upload_token"]
+    second_token = _upload_csv(client, account_id).json()["upload_token"]
+    assert first_token != second_token
+
+    first = client.post(
+        "/api/upload/confirm",
+        json={"upload_token": first_token, "selected_indices": [0, 1]},
+    )
+    assert first.status_code == 200
+    assert first.json()["inserted"] == 2
+
+    second = client.post(
+        "/api/upload/confirm",
+        json={"upload_token": second_token, "selected_indices": [0, 1]},
+    )
+    assert second.status_code == 409
+
+    txns = client.get("/api/transactions").json()
+    assert len(txns) == 2  # only the first confirm's rows, not double-inserted
+
+
 def test_confirm_rejects_out_of_range_index(client):
     account_id = _register_phonepe_account(client)
     token = _upload_csv(client, account_id).json()["upload_token"]

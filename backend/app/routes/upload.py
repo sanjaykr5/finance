@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass, field
 from threading import Lock
 
+import duckdb
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
@@ -166,45 +167,72 @@ def confirm_upload(body: ConfirmUpload):
 
     conn = get_conn()
     inserted_ids: list[int] = []
-    for i in selected_indices:
-        t = staged.rows[i]
-        row = conn.execute(
-            f"""
-            INSERT INTO "{staged.table_name}"
-              (id, txn_date, description, amount, txn_type,
-               account_last4, instrument, txn_ref, txn_time, transaction_id,
-               source_file, raw, dedup_hash)
-            VALUES (nextval('seq_txn'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING id
+
+    conn.execute("BEGIN TRANSACTION")
+
+    already_committed = conn.execute(
+        "SELECT id FROM uploaded_files WHERE sha256 = ?", [staged.sha256]
+    ).fetchone()
+    if already_committed:
+        conn.execute("ROLLBACK")
+        raise HTTPException(
+            409,
+            "This exact file was already uploaded — a different confirm for "
+            "the same file landed first.",
+        )
+
+    try:
+        for i in selected_indices:
+            t = staged.rows[i]
+            row = conn.execute(
+                f"""
+                INSERT INTO "{staged.table_name}"
+                  (id, txn_date, description, amount, txn_type,
+                   account_last4, instrument, txn_ref, txn_time, transaction_id,
+                   source_file, raw, dedup_hash)
+                VALUES (nextval('seq_txn'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
+                """,
+                [
+                    t.txn_date,
+                    t.description,
+                    str(t.amount),
+                    t.txn_type,
+                    t.account_last4,
+                    t.instrument,
+                    t.txn_ref,
+                    t.txn_time,
+                    t.transaction_id,
+                    staged.filename,
+                    json.dumps(t.raw, default=str),
+                    staged.dedup_hashes[i],
+                ],
+            ).fetchone()
+            inserted_ids.append(row[0])
+
+        conn.execute(
+            """
+            INSERT INTO uploaded_files
+              (id, filename, sha256, account_id, parser_used, rows_parsed, rows_inserted)
+            VALUES (nextval('seq_file'), ?, ?, ?, ?, ?, ?)
             """,
             [
-                t.txn_date,
-                t.description,
-                str(t.amount),
-                t.txn_type,
-                t.account_last4,
-                t.instrument,
-                t.txn_ref,
-                t.txn_time,
-                t.transaction_id,
-                staged.filename,
-                json.dumps(t.raw, default=str),
-                staged.dedup_hashes[i],
+                staged.filename, staged.sha256, staged.account_id, staged.label,
+                len(staged.rows), len(inserted_ids),
             ],
-        ).fetchone()
-        inserted_ids.append(row[0])
+        )
 
-    conn.execute(
-        """
-        INSERT INTO uploaded_files
-          (id, filename, sha256, account_id, parser_used, rows_parsed, rows_inserted)
-        VALUES (nextval('seq_file'), ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            staged.filename, staged.sha256, staged.account_id, staged.label,
-            len(staged.rows), len(inserted_ids),
-        ],
-    )
+        conn.execute("COMMIT")
+    except duckdb.CatalogException:
+        conn.execute("ROLLBACK")
+        raise HTTPException(
+            400,
+            "The account this file was parsed against no longer exists — "
+            "re-parse it against a different account.",
+        )
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
     auto_tagged = apply_rules_to_transaction_ids(inserted_ids)
 
