@@ -3,14 +3,18 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolated_db(tmp_path, monkeypatch):
-    """Every test gets a throwaway DuckDB file — never the real
-    backend/expense.duckdb. Applies to every test automatically, whether or
-    not it explicitly requests `conn` or `client`.
+    """Every test gets a throwaway DuckDB file and Fernet key file — never
+    the real backend/expense.duckdb or backend/.secret.key. Applies to every
+    test automatically, whether or not it explicitly requests `conn` or
+    `client`.
     """
+    from app import crypto as crypto_module
     from app import db as db_module
 
     monkeypatch.setattr(db_module, "DB_PATH", tmp_path / "test.duckdb")
     monkeypatch.setattr(db_module, "_conn", None)
+    monkeypatch.setattr(crypto_module, "_KEY_PATH", tmp_path / "test.secret.key")
+    monkeypatch.setattr(crypto_module, "_fernet", None)
     yield
     db_module._conn = None
 

@@ -5,3 +5,4 @@ pdfplumber==0.11.4
 pandas==2.2.3
 python-multipart==0.0.18
 pydantic==2.10.4
+cryptography==48.0.0
