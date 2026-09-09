@@ -134,6 +134,7 @@ export default function Upload() {
     setPassword('')
     setResult(null)
     setDuplicateMessage('')
+    setError('')
     if (inputRef.current) inputRef.current.value = ''
   }
 
