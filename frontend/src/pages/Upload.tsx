@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import {
   CheckCircle2,
   FileText,
@@ -114,6 +114,9 @@ export default function Upload() {
       setStage('done')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+      setStage('form')
+      setUploadToken(null)
+      setRows([])
     } finally {
       setBusy(false)
     }
@@ -165,9 +168,9 @@ export default function Upload() {
               {accounts.length === 0 ? (
                 <p className="mt-1 text-sm text-muted-foreground">
                   No accounts yet —{' '}
-                  <a href="/accounts" className="underline">
+                  <Link to="/accounts" className="underline">
                     add one first
-                  </a>
+                  </Link>
                   .
                 </p>
               ) : (
