@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -10,8 +11,9 @@ def _get_fernet() -> Fernet:
     global _fernet
     if _fernet is None:
         if not _KEY_PATH.exists():
-            _KEY_PATH.write_bytes(Fernet.generate_key())
-            _KEY_PATH.chmod(0o600)
+            fd = os.open(_KEY_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(Fernet.generate_key())
         _fernet = Fernet(_KEY_PATH.read_bytes())
     return _fernet
 
