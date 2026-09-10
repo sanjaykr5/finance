@@ -1,0 +1,6 @@
+__pycache__
+*.pyc
+.venv
+expense.duckdb
+expense.duckdb.wal
+.secret.key
