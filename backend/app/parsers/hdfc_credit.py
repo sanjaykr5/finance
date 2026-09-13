@@ -24,14 +24,24 @@ vertically closer to that anchor than to its neighbouring anchors, and
 sorts those words top-to-bottom to reconstruct the description in the
 right order regardless of which side of the anchor they rendered on.
 
-Every transaction is a debit (increases the amount due) except payments
-back to the card, which HDFC always describes starting with "AUTOPAY" or
-similar. As a safety net beyond that keyword heuristic, this parser
-cross-checks its own debit/credit totals against the statement's own
-printed "PURCHASES/DEBIT" and "PAYMENTS/CREDITS RECEIVED" summary figures
-for the current billing cycle, and refuses to return any results if they
-don't match to the cent — so a transaction shape this parser doesn't
-recognise yet fails loudly instead of silently importing a wrong number.
+Every transaction is a debit (increases the amount due) except money coming
+back onto the card — a payment, a merchant return, or any other reversal.
+HDFC marks that distinction typographically rather than in the description
+text: a credit's amount is preceded by a bare "+" that isn't attached to a
+reward-points count (e.g. "AUTOPAY THANK YOU ... + C 29,662.00", or a
+returned purchase's reward points getting clawed back, "- 332 + C
+12,506.00"), whereas an ordinary purchase or fee has no such marker ("+ 8 C
+382.32" — that "+" belongs to the points count, not the amount; "C 68.77" —
+no points and no marker at all). This is more reliable than keying off the
+description (e.g. "AUTOPAY") since not every credit announces itself in
+words — a small merchant-side adjustment can be indistinguishable from a
+fee by description alone, and only carries this typographic marker. As a
+safety net beyond it, this parser cross-checks its own debit/credit totals
+against the statement's own printed "PURCHASES/DEBIT" and "PAYMENTS/CREDITS
+RECEIVED" summary figures for the current billing cycle, and refuses to
+return any results if they don't match to the cent — so a transaction shape
+this parser doesn't recognise yet fails loudly instead of silently
+importing a wrong number.
 """
 
 import io
@@ -53,11 +63,15 @@ _EPS = 1.0
 
 DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}\|?$")
 TIME_RE = re.compile(r"^\d{2}:\d{2}$")
-# "+ 8 C 382.32": reward points earned, then the (always unsigned) amount.
-AMOUNT_WITH_POINTS_RE = re.compile(r"^\+\s*(\d+)\s*C\s*([\d,]+\.\d{2})$")
-# "+ C 11,749.00" (no points, e.g. a payment) or plain "C 68.77" (a fee/tax
-# line, which HDFC doesn't even print a "+" placeholder for).
-AMOUNT_PLAIN_RE = re.compile(r"^\+?\s*C\s*([\d,]+\.\d{2})$")
+# "+ 8 C 382.32": reward points earned, then the (always unsigned) amount —
+# the "+" here is the points' own sign, not a credit marker (see below).
+# Points can also be negative ("- 332 + C 12,506.00", points clawed back on
+# a returned purchase), in which case a *separate* "+" appears right before
+# "C" — that one is the credit marker, captured as group 3.
+AMOUNT_WITH_POINTS_RE = re.compile(r"^([+-])\s*(\d+)\s*(\+)?\s*C\s*([\d,]+\.\d{2})$")
+# "+ C 11,749.00" (no points shown, e.g. a payment — the "+" here is the
+# credit marker) or plain "C 68.77" (a fee/tax line, no points and no "+").
+AMOUNT_PLAIN_RE = re.compile(r"^(\+)?\s*C\s*([\d,]+\.\d{2})$")
 # "C11,749.47 C11,749.00 + C382.32 + C0.00 =" → previous dues, payments/
 # credits received, purchases/debit, finance charges, all for the current
 # billing cycle — used to cross-check the parsed rows below.
@@ -66,13 +80,6 @@ SUMMARY_RE = re.compile(
 )
 CARD_RE = re.compile(r"Credit Card No\.\s*(\S+)")
 REF_RE = re.compile(r"Ref#\s*([A-Za-z0-9]+)")
-
-# Keywords that mark a row as money coming back onto the card (a credit)
-# rather than a purchase/fee (a debit). Only "AUTOPAY ..." has been seen in
-# practice; the rest are a safety net for refunds/reversals this parser
-# hasn't encountered yet. The summary cross-check below is what actually
-# guarantees correctness, not this list.
-CREDIT_KEYWORDS = ("AUTOPAY", "PAYMENT RECEIVED", "REFUND", "REVERSAL", "CASHBACK")
 
 # Phrases (as consecutive words) that mark the end of a transactions table,
 # so the last row's word-band doesn't bleed into whatever summary content
@@ -129,7 +136,7 @@ class HDFCCreditCardParser:
         debit_total = Decimal("0")
         credit_total = Decimal("0")
         for r in rows:
-            is_credit = _is_credit(r["description"])
+            is_credit = r["is_credit"]
             if is_credit:
                 credit_total += r["amount"]
             else:
@@ -169,11 +176,6 @@ class HDFCCreditCardParser:
 
 def _to_decimal(s: str) -> Decimal:
     return Decimal(s.replace(",", ""))
-
-
-def _is_credit(description: str) -> bool:
-    upper = description.upper()
-    return any(k in upper for k in CREDIT_KEYWORDS)
 
 
 def _find_headers(words: list[dict]) -> list[dict]:
@@ -253,8 +255,10 @@ def _build_row(anchor: dict, band_words: list[dict], header: dict) -> dict:
 
     m = AMOUNT_WITH_POINTS_RE.match(tail)
     if m:
-        reward_points = int(m.group(1))
-        amount = _to_decimal(m.group(2))
+        sign = -1 if m.group(1) == "-" else 1
+        reward_points = sign * int(m.group(2))
+        is_credit = m.group(3) is not None
+        amount = _to_decimal(m.group(4))
     else:
         m = AMOUNT_PLAIN_RE.match(tail)
         if not m:
@@ -262,13 +266,15 @@ def _build_row(anchor: dict, band_words: list[dict], header: dict) -> dict:
                 f"Unrecognised amount format {tail!r} on row dated {date_str}"
             )
         reward_points = 0
-        amount = _to_decimal(m.group(1))
+        is_credit = m.group(1) is not None
+        amount = _to_decimal(m.group(2))
 
     return {
         "date": datetime.strptime(date_str, "%d/%m/%Y").date(),
         "time": time_word["text"] if time_word else None,
         "description": description,
         "reward_points": reward_points,
+        "is_credit": is_credit,
         "amount": amount,
     }
 
@@ -281,7 +287,15 @@ def _extract_rows(page) -> list[dict]:
         stop_top = _find_stop_top(words, header["top"])
         if h_idx + 1 < len(headers):
             stop_top = min(stop_top, headers[h_idx + 1]["top"])
-        table_words = [w for w in words if header["top"] < w["top"] <= stop_top]
+        # Strict `<`: stop_top is the top of the boundary row itself (the
+        # next table's header, or the first word of a stop phrase) and must
+        # be excluded, not just anything below it — otherwise, when a page
+        # holds two back-to-back tables (Domestic then International) with
+        # no vertical gap between them, the last Domestic row's band and the
+        # International header's row can land at the exact same `top`, and
+        # the header's own words ("REWARDS AMOUNT PI") get swallowed into
+        # that row's description/amount.
+        table_words = [w for w in words if header["top"] < w["top"] < stop_top]
 
         anchors = sorted(
             (
@@ -314,7 +328,7 @@ def _extract_rows(page) -> list[dict]:
                 else stop_top
             )
             band_words = [
-                w for w in table_words if band_top < w["top"] <= band_bottom
+                w for w in table_words if band_top < w["top"] < band_bottom
             ]
             rows.append(_build_row(anchor, band_words, header))
     return rows

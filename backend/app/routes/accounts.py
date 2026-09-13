@@ -12,14 +12,10 @@ VALID_KINDS = ("bank", "credit_card", "upi")
 class AccountCreate(BaseModel):
     kind: str  # 'bank' | 'credit_card' | 'upi'
     provider: str
-    nickname: str | None = None
-    account_last4: str | None = None
     password: str | None = None
 
 
 class AccountUpdate(BaseModel):
-    nickname: str | None = None
-    account_last4: str | None = None
     password: str | None = None
 
 
@@ -32,7 +28,7 @@ def list_accounts(kind: list[str] | None = Query(None)):
         params = list(kind)
     rows = conn.execute(
         f"""
-        SELECT id, kind, provider, nickname, account_last4, label, parser,
+        SELECT id, kind, provider, label, parser,
                encrypted_password IS NOT NULL AS has_password
         FROM accounts
         {where_sql}
@@ -40,10 +36,7 @@ def list_accounts(kind: list[str] | None = Query(None)):
         """,
         params,
     ).fetchall()
-    cols = [
-        "id", "kind", "provider", "nickname", "account_last4", "label",
-        "parser", "has_password",
-    ]
+    cols = ["id", "kind", "provider", "label", "parser", "has_password"]
     return [dict(zip(cols, r)) for r in rows]
 
 
@@ -58,8 +51,6 @@ def create_account(a: AccountCreate):
         conn,
         kind=a.kind,
         provider=a.provider.strip(),
-        nickname=(a.nickname or None),
-        account_last4=(a.account_last4 or None),
         parser=resolve_parser_key(a.kind, a.provider),
         password=(a.password or None),
     )

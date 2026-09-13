@@ -46,8 +46,17 @@ from .base import ParsedTransaction, PasswordRequiredError, UnsupportedFileError
 TXN_RE = re.compile(r"^(\d{2})([A-Z]{3})\s+(.+?)\s+([\d,]+\.\d{2})(\s+CR)?$")
 STOP_RE = re.compile(r"^TOTAL PURCHASE OUTSTANDING")
 PERIOD_RE = re.compile(r"(\d{2}) ([A-Z]{3}) (\d{4}) To (\d{2}) ([A-Z]{3}) (\d{4})")
-OPENING_BALANCE_RE = re.compile(r"OPENING BALANCE\s+([\d,]+\.\d{2})")
 CARD_RE = re.compile(r"(51xx xxxx xxxx \d{4})\s+[A-Z .]+")
+# The "NET OUTSTANDING BALANCE <amount>" line always immediately precedes
+# the statement's own running-summary row: opening balance, total debit,
+# total credit, closing balance. Anchoring on this fixed phrase (rather
+# than re-searching for a previously-captured amount as a literal — which
+# can collide with the trailing "0.00" of an unrelated larger number, e.g.
+# when the opening balance itself is 0.00) is what makes this reliable.
+SUMMARY_RE = re.compile(
+    r"NET OUTSTANDING BALANCE\s+[\d,]+\.\d{2}\s*\n\s*"
+    r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})"
+)
 
 
 class HSBCCreditCardParser:
@@ -82,21 +91,7 @@ class HSBCCreditCardParser:
             instrument = card_match.group(1) if card_match else None
             last4 = instrument[-4:] if instrument else None
 
-            ob_match = OPENING_BALANCE_RE.search(full_text)
-            if not ob_match:
-                raise ValueError("Could not locate this statement's opening balance")
-            summary_match = re.search(
-                re.escape(ob_match.group(1))
-                + r"\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})",
-                full_text,
-            )
-            if not summary_match:
-                raise ValueError(
-                    "Could not locate this statement's running summary totals "
-                    "to cross-check the parsed transactions against"
-                )
-            expected_debit = _to_decimal(summary_match.group(1))
-            expected_credit = _to_decimal(summary_match.group(2))
+            expected_debit, expected_credit = _extract_summary_totals(full_text)
 
             rows = []
             for page in pdf.pages:
@@ -147,6 +142,21 @@ class HSBCCreditCardParser:
             )
 
         return txns
+
+
+def _extract_summary_totals(full_text: str) -> tuple[Decimal, Decimal]:
+    """Locate the statement's own running summary row and return
+    (expected_debit, expected_credit) to cross-check parsed rows against."""
+    summary_match = SUMMARY_RE.search(full_text)
+    if not summary_match:
+        raise ValueError(
+            "Could not locate this statement's running summary totals "
+            "to cross-check the parsed transactions against"
+        )
+    return (
+        _to_decimal(summary_match.group(2)),
+        _to_decimal(summary_match.group(3)),
+    )
 
 
 def _to_decimal(s: str) -> Decimal:

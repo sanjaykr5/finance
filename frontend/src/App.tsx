@@ -12,7 +12,7 @@ export default function App() {
     <div className="flex h-screen bg-background text-foreground">
       <Sidebar />
       <main className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-7xl px-6 py-8 lg:px-10">
+        <div className="px-1 py-8">
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />

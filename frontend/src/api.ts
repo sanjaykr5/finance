@@ -61,6 +61,8 @@ export type Transaction = {
   tag_id: number | null
   tag_name: string | null
   tag_color: string | null
+  notes: string | null
+  audited: boolean
 }
 
 export type Tag = {
@@ -70,11 +72,6 @@ export type Tag = {
   txn_count: number
 }
 
-export type Account = {
-  instrument: string
-  account_last4: string | null
-}
-
 export type Rule = {
   id: number
   tag_id: number
@@ -82,6 +79,8 @@ export type Rule = {
   match_type: 'contains' | 'regex'
   pattern: string
   priority: number
+  account_id: number | null
+  account_label: string | null
 }
 
 export type DashboardSummary = {
@@ -112,8 +111,6 @@ export type RegisteredAccount = {
   id: number
   kind: 'bank' | 'credit_card' | 'upi'
   provider: string
-  nickname: string | null
-  account_last4: string | null
   label: string
   parser: string | null
   has_password: boolean

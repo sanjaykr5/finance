@@ -36,20 +36,23 @@ const KINDS = [
 
 type Kind = (typeof KINDS)[number]['value']
 
+// Which providers can be picked for each account kind.
+const PROVIDERS_BY_KIND: Record<Kind, readonly string[]> = {
+  bank: ['SBI', 'HDFC', 'AXIS', 'HSBC'],
+  credit_card: ['SBI', 'HDFC', 'AXIS', 'HSBC'],
+  upi: ['PhonePe', 'Google Pay'],
+}
+
 type FormState = {
   kind: Kind
   provider: string
-  nickname: string
-  account_last4: string
   password: string
   clearPassword: boolean
 }
 
 const EMPTY_FORM: FormState = {
   kind: 'bank',
-  provider: '',
-  nickname: '',
-  account_last4: '',
+  provider: PROVIDERS_BY_KIND.bank[0],
   password: '',
   clearPassword: false,
 }
@@ -80,8 +83,6 @@ export default function AccountsPage() {
     setForm({
       kind: a.kind,
       provider: a.provider,
-      nickname: a.nickname ?? '',
-      account_last4: a.account_last4 ?? '',
       password: '',
       clearPassword: false,
     })
@@ -99,21 +100,13 @@ export default function AccountsPage() {
     setError('')
     try {
       if (editingId === null) {
-        if (!form.provider.trim()) {
-          setError('Provider is required.')
-          return
-        }
         await api.post('/accounts', {
           kind: form.kind,
-          provider: form.provider.trim(),
-          nickname: form.nickname || null,
-          account_last4: form.account_last4 || null,
+          provider: form.provider,
           password: form.password || null,
         })
       } else {
         await api.patch(`/accounts/${editingId}`, {
-          nickname: form.nickname || null,
-          account_last4: form.account_last4 || null,
           ...(form.clearPassword
             ? { password: '' }
             : form.password
@@ -169,7 +162,10 @@ export default function AccountsPage() {
                 {editingId === null ? (
                   <Select
                     value={form.kind}
-                    onValueChange={(v) => setForm({ ...form, kind: v as Kind })}
+                    onValueChange={(v) => {
+                      const kind = v as Kind
+                      setForm({ ...form, kind, provider: PROVIDERS_BY_KIND[kind][0] })
+                    }}
                   >
                     <SelectTrigger className="mt-1">
                       <SelectValue />
@@ -192,30 +188,25 @@ export default function AccountsPage() {
               </div>
               <div>
                 <Label className="text-xs text-muted-foreground">Provider</Label>
-                <Input
-                  className="mt-1"
-                  value={form.provider}
-                  disabled={editingId !== null}
-                  onChange={(e) => setForm({ ...form, provider: e.target.value })}
-                  placeholder="e.g. HDFC, HSBC, PhonePe"
-                />
-              </div>
-              <div>
-                <Label className="text-xs text-muted-foreground">Nickname (optional)</Label>
-                <Input
-                  className="mt-1"
-                  value={form.nickname}
-                  onChange={(e) => setForm({ ...form, nickname: e.target.value })}
-                />
-              </div>
-              <div>
-                <Label className="text-xs text-muted-foreground">Last 4 digits (optional)</Label>
-                <Input
-                  className="mt-1"
-                  value={form.account_last4}
-                  onChange={(e) => setForm({ ...form, account_last4: e.target.value })}
-                  maxLength={4}
-                />
+                {editingId === null ? (
+                  <Select
+                    value={form.provider}
+                    onValueChange={(v) => setForm({ ...form, provider: v })}
+                  >
+                    <SelectTrigger className="mt-1">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PROVIDERS_BY_KIND[form.kind].map((p) => (
+                        <SelectItem key={p} value={p}>
+                          {p}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input className="mt-1" value={form.provider} disabled />
+                )}
               </div>
               <div className="md:col-span-2">
                 <Label className="text-xs text-muted-foreground">
@@ -275,8 +266,6 @@ export default function AccountsPage() {
             <TableRow className="bg-muted/40 hover:bg-muted/40">
               <TableHead>Kind</TableHead>
               <TableHead>Provider</TableHead>
-              <TableHead>Nickname</TableHead>
-              <TableHead>Last 4</TableHead>
               <TableHead>Parser</TableHead>
               <TableHead>Password</TableHead>
               <TableHead className="text-right">Actions</TableHead>
@@ -291,10 +280,6 @@ export default function AccountsPage() {
                   </Badge>
                 </TableCell>
                 <TableCell className="font-medium">{a.provider}</TableCell>
-                <TableCell className="text-muted-foreground">{a.nickname ?? '—'}</TableCell>
-                <TableCell className="text-muted-foreground">
-                  {a.account_last4 ?? '—'}
-                </TableCell>
                 <TableCell className="text-muted-foreground">
                   {a.parser ?? 'Not configured'}
                 </TableCell>
@@ -322,7 +307,7 @@ export default function AccountsPage() {
             ))}
             {accounts.length === 0 && (
               <TableRow>
-                <TableCell colSpan={7} className="h-32 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={5} className="h-32 text-center text-sm text-muted-foreground">
                   No accounts yet — add one above.
                 </TableCell>
               </TableRow>

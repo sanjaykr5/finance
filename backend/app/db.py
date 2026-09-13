@@ -75,8 +75,6 @@ def _bootstrap(conn: duckdb.DuckDBPyConnection) -> None:
             id BIGINT PRIMARY KEY,
             kind VARCHAR NOT NULL,        -- 'bank' | 'credit_card' | 'upi'
             provider VARCHAR NOT NULL,    -- 'HDFC', 'HSBC', 'PhonePe', ...
-            nickname VARCHAR,
-            account_last4 VARCHAR,
             table_name VARCHAR UNIQUE NOT NULL,
             parser VARCHAR,                -- key into parsers.detect.PARSERS_BY_KEY, or NULL
             label VARCHAR NOT NULL,        -- display label, e.g. 'HSBC Credit Card'
@@ -85,6 +83,7 @@ def _bootstrap(conn: duckdb.DuckDBPyConnection) -> None:
         """
     )
     _migrate_accounts_password_column(conn)
+    _migrate_accounts_drop_nickname_and_last4(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS tags (
@@ -104,15 +103,27 @@ def _bootstrap(conn: duckdb.DuckDBPyConnection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS transaction_meta (
+            transaction_id BIGINT PRIMARY KEY,
+            notes VARCHAR,
+            audited BOOLEAN DEFAULT FALSE
+        );
+        """
+    )
+    _migrate_transaction_meta_drop_share_pct(conn)
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS tag_rules (
             id BIGINT PRIMARY KEY,
             tag_id BIGINT NOT NULL,
             match_type VARCHAR NOT NULL,
             pattern VARCHAR NOT NULL,
-            priority INTEGER DEFAULT 0
+            priority INTEGER DEFAULT 0,
+            account_id BIGINT
         );
         """
     )
+    _migrate_tag_rules_account_id_column(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS uploaded_files (
@@ -165,7 +176,7 @@ def _default_label(kind: str, provider: str) -> str:
 
 
 _ACCOUNT_COLUMNS = (
-    "id", "kind", "provider", "nickname", "account_last4", "table_name",
+    "id", "kind", "provider", "table_name",
     "parser", "label",
 )
 
@@ -174,8 +185,6 @@ def register_account(
     conn: duckdb.DuckDBPyConnection,
     kind: str,
     provider: str,
-    nickname: str | None = None,
-    account_last4: str | None = None,
     parser: str | None = None,
     password: str | None = None,
 ) -> dict:
@@ -192,11 +201,11 @@ def register_account(
     conn.execute(_ACCOUNT_TABLE_DDL.format(table_name=table_name))
     row = conn.execute(
         f"""
-        INSERT INTO accounts (id, kind, provider, nickname, account_last4, table_name, parser, label)
-        VALUES (nextval('seq_account'), ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO accounts (id, kind, provider, table_name, parser, label)
+        VALUES (nextval('seq_account'), ?, ?, ?, ?, ?)
         RETURNING {", ".join(_ACCOUNT_COLUMNS)}
         """,
-        [kind, provider, nickname, account_last4, table_name, parser, label],
+        [kind, provider, table_name, parser, label],
     ).fetchone()
     if password:
         conn.execute(
@@ -210,15 +219,15 @@ def register_account(
 
 
 def update_account(conn: duckdb.DuckDBPyConnection, account_id: int, **fields) -> dict | None:
-    """Partially update an existing account. `fields` may include any of
-    `nickname`, `account_last4`, `password` — only keys actually passed are
-    written (the route layer uses Pydantic's `exclude_unset` to build this
-    dict, so an omitted field is left alone). `password=""` clears the
-    stored password; a non-empty `password` is encrypted and stored.
-    `kind`/`provider` are intentionally not accepted here — both are baked
-    into the account's physical table name and parser assignment at
-    creation time. Returns the refreshed account dict (matching
-    `register_account`'s shape) or `None` if the id doesn't exist.
+    """Partially update an existing account. `fields` may include
+    `password` — only keys actually passed are written (the route layer
+    uses Pydantic's `exclude_unset` to build this dict, so an omitted field
+    is left alone). `password=""` clears the stored password; a non-empty
+    `password` is encrypted and stored. `kind`/`provider` are intentionally
+    not accepted here — both are baked into the account's physical table
+    name and parser assignment at creation time. Returns the refreshed
+    account dict (matching `register_account`'s shape) or `None` if the id
+    doesn't exist.
     """
     exists = conn.execute("SELECT 1 FROM accounts WHERE id = ?", [account_id]).fetchone()
     if not exists:
@@ -226,12 +235,6 @@ def update_account(conn: duckdb.DuckDBPyConnection, account_id: int, **fields) -
 
     sets: list[str] = []
     params: list = []
-    if "nickname" in fields:
-        sets.append("nickname = ?")
-        params.append(fields["nickname"])
-    if "account_last4" in fields:
-        sets.append("account_last4 = ?")
-        params.append(fields["account_last4"])
     if "password" in fields:
         password = fields["password"]
         sets.append("encrypted_password = ?")
@@ -273,7 +276,11 @@ def drop_account(conn: duckdb.DuckDBPyConnection, account_id: int) -> bool:
     conn.execute(
         f'DELETE FROM transaction_tags WHERE transaction_id IN (SELECT id FROM "{table_name}")'
     )
+    conn.execute(
+        f'DELETE FROM transaction_meta WHERE transaction_id IN (SELECT id FROM "{table_name}")'
+    )
     conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+    conn.execute("DELETE FROM tag_rules WHERE account_id = ?", [account_id])
     conn.execute("DELETE FROM accounts WHERE id = ?", [account_id])
     _rebuild_all_transactions_view(conn)
     return True
@@ -288,6 +295,36 @@ def table_name_for_txn(conn: duckdb.DuckDBPyConnection, txn_id: int) -> str | No
         "SELECT table_name FROM all_transactions WHERE id = ?", [txn_id]
     ).fetchone()
     return row[0] if row else None
+
+
+_TXN_META_COLUMNS = ("notes", "audited")
+_TXN_META_DEFAULTS = {"notes": None, "audited": False}
+
+
+def upsert_transaction_meta(conn: duckdb.DuckDBPyConnection, txn_id: int, **fields) -> None:
+    """Merge `fields` (any of notes/audited) into transaction_meta for one
+    transaction, creating its row on first write. Only keys actually passed
+    are changed — an omitted field keeps its previous value, or the column
+    default if the transaction has no row yet.
+    """
+    if not fields:
+        return
+    row = conn.execute(
+        f"SELECT {', '.join(_TXN_META_COLUMNS)} FROM transaction_meta WHERE transaction_id = ?",
+        [txn_id],
+    ).fetchone()
+    current = dict(zip(_TXN_META_COLUMNS, row)) if row else dict(_TXN_META_DEFAULTS)
+    current.update(fields)
+    conn.execute(
+        """
+        INSERT INTO transaction_meta (transaction_id, notes, audited)
+        VALUES (?, ?, ?)
+        ON CONFLICT (transaction_id) DO UPDATE SET
+            notes = excluded.notes,
+            audited = excluded.audited
+        """,
+        [txn_id, current["notes"], current["audited"]],
+    )
 
 
 def _rebuild_all_transactions_view(conn: duckdb.DuckDBPyConnection) -> None:
@@ -353,6 +390,88 @@ def _migrate_accounts_password_column(conn: duckdb.DuckDBPyConnection) -> None:
     ).fetchone()
     if not exists:
         conn.execute("ALTER TABLE accounts ADD COLUMN encrypted_password VARCHAR")
+
+
+def _migrate_tag_rules_account_id_column(conn: duckdb.DuckDBPyConnection) -> None:
+    """One-time upgrade: add the nullable account_id column to `tag_rules`
+    if it doesn't exist yet, so an existing rule keeps matching every
+    account (NULL) until someone scopes it. Same pattern as
+    _migrate_accounts_password_column.
+    """
+    exists = conn.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'tag_rules' AND column_name = 'account_id'
+        """
+    ).fetchone()
+    if not exists:
+        conn.execute("ALTER TABLE tag_rules ADD COLUMN account_id BIGINT")
+
+
+def _migrate_transaction_meta_drop_share_pct(conn: duckdb.DuckDBPyConnection) -> None:
+    """One-time upgrade: drop the retired `share_pct` column from
+    `transaction_meta` if a pre-existing database still has it. Unlike
+    `accounts.nickname`/`account_last4`, `share_pct` isn't followed by an
+    indexed column, so a plain DROP COLUMN works here.
+    """
+    exists = conn.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'transaction_meta' AND column_name = 'share_pct'
+        """
+    ).fetchone()
+    if exists:
+        conn.execute("ALTER TABLE transaction_meta DROP COLUMN share_pct")
+
+
+def _migrate_accounts_drop_nickname_and_last4(conn: duckdb.DuckDBPyConnection) -> None:
+    """One-time upgrade: drop the retired `nickname` and `account_last4`
+    columns from `accounts` if a pre-existing database still has them.
+    Unrelated to the per-transaction `account_last4` column on each
+    account's own table, which stays.
+
+    DuckDB refuses a plain `ALTER TABLE ... DROP COLUMN` here — `nickname`
+    and `account_last4` sit before `table_name`, which carries a UNIQUE
+    index, and DuckDB can't drop a column before an indexed one. So instead
+    this rebuilds the table under the new shape and copies the data across.
+    """
+    existing = {
+        r[0]
+        for r in conn.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'accounts' AND column_name IN ('nickname', 'account_last4')
+            """
+        ).fetchall()
+    }
+    if not existing:
+        return
+
+    conn.execute("ALTER TABLE accounts RENAME TO accounts_legacy")
+    conn.execute(
+        """
+        CREATE TABLE accounts (
+            id BIGINT PRIMARY KEY,
+            kind VARCHAR NOT NULL,
+            provider VARCHAR NOT NULL,
+            table_name VARCHAR UNIQUE NOT NULL,
+            parser VARCHAR,
+            label VARCHAR NOT NULL,
+            created_at TIMESTAMP DEFAULT now(),
+            encrypted_password VARCHAR
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO accounts (id, kind, provider, table_name, parser, label,
+                               created_at, encrypted_password)
+        SELECT id, kind, provider, table_name, parser, label,
+               created_at, encrypted_password
+        FROM accounts_legacy
+        """
+    )
+    conn.execute("DROP TABLE accounts_legacy")
 
 
 # Sources the app used to write into a single `transactions` table, back

@@ -6,3 +6,7 @@ pandas==2.2.3
 python-multipart==0.0.18
 pydantic==2.10.4
 cryptography==48.0.0
+# hsbc_savings parser OCRs scanned statement PDFs — also needs the
+# `tesseract` binary installed on the host (e.g. `brew install tesseract`
+# / `apt install tesseract-ocr`); pytesseract just shells out to it.
+pytesseract==0.3.13

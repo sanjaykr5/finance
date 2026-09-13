@@ -5,6 +5,7 @@ export default function TransactionsPage() {
     <TransactionsView
       title="Transactions"
       emptyMessage="No transactions match the filters. Try uploading a statement."
+      fixedKinds={['bank', 'upi']}
     />
   )
 }

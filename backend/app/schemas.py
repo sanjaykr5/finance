@@ -11,7 +11,14 @@ class RuleCreate(BaseModel):
     match_type: str  # 'contains' | 'regex'
     pattern: str
     priority: int = 0
+    account_id: int | None = None  # restrict the rule to one account, or None for all
 
 
-class TagAssign(BaseModel):
+class TransactionUpdate(BaseModel):
+    tag_id: int | None = None
+    notes: str | None = None
+    audited: bool | None = None
+
+
+class RulesApply(BaseModel):
     tag_id: int | None = None
