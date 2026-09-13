@@ -18,7 +18,7 @@ category (e.g. an Amazon purchase that's both "Subscriptions" and
 
 - **Tag update API**: full replace, not incremental add/remove. `PATCH
   /transactions/{id}` takes `tag_ids: list[int]` and replaces the whole set
-  in one call — same pattern already used for `notes`/`audited`/`share_pct`.
+  in one call — same pattern already used for `notes`/`audited`.
   No new routes.
 - **Rule auto-tagging**: a transaction can pick up several tags at once.
   Every rule that matches an untagged-for-that-tag transaction adds its tag;
@@ -92,7 +92,6 @@ class TransactionUpdate(BaseModel):
     tag_ids: list[int] | None = None
     notes: str | None = None
     audited: bool | None = None
-    share_pct: float | None = None
 ```
 
 `tag_ids=None` still means "field not sent" under `exclude_unset=True`
@@ -141,8 +140,7 @@ SELECT t.id, t.txn_date, t.description, t.amount, t.currency, t.source,
         JOIN tags tg ON tg.id = tt.tag_id WHERE tt.transaction_id = t.id) AS tag_names,
        (SELECT list(tg.color ORDER BY tg.name) FROM transaction_tags tt
         JOIN tags tg ON tg.id = tt.tag_id WHERE tt.transaction_id = t.id) AS tag_colors,
-       tm.notes, COALESCE(tm.audited, FALSE) AS audited,
-       COALESCE(tm.share_pct, 100) AS share_pct
+       tm.notes, COALESCE(tm.audited, FALSE) AS audited
 FROM all_transactions t
 LEFT JOIN transaction_meta tm ON tm.transaction_id = t.id
 ```
